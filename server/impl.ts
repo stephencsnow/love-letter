@@ -11,8 +11,10 @@ import {
   IStartGameRequest,
   IPlayCardRequest,
   IDrawCardRequest,
-  Action,
+  EventType,
+  GameState,
 } from "../api/types";
+import { readlink } from "fs";
 
 type InternalPlayerInfo = PlayerInfo;
 type InternalState = {
@@ -24,6 +26,7 @@ type InternalState = {
   winner?: UserId;
   events: Event[];
   playerEventLogs: Map<UserId, string[]>;
+  gameState: GameState;
 };
 
 const CARD_DETAILS: Map<CardType, { numInDeck: number; value: number }> =
@@ -49,6 +52,7 @@ export class Impl implements Methods<InternalState> {
       discard: [],
       events: [],
       playerEventLogs: new Map(),
+      gameState: GameState.WAITING_TO_START_GAME,
     };
   }
   joinGame(
@@ -68,9 +72,13 @@ export class Impl implements Methods<InternalState> {
     ctx: Context,
     request: IStartGameRequest
   ): Response {
+    if (state.gameState == GameState.MID_ROUND) {
+      return Response.error("Cannot perform this action at this time.");
+    }
     if (state.players.length < 2) {
       return Response.error("At least 2 players required");
-    } else if (state.players.length > 4) {
+    }
+    if (state.players.length > 4) {
       return Response.error("At most 4 players");
     }
 
@@ -80,7 +88,19 @@ export class Impl implements Methods<InternalState> {
       state.hands.set(player.id, [deck.pop()!]);
     });
     state.drawPile = deck;
-    state.activePlayer = ctx.chance.pickone(state.players).id;
+    state.discard = [];
+    resolveEvent({ type: EventType.ROUND_START }, state);
+
+    if (state.winner) {
+      // last round's winner goes first
+      state.activePlayer = state.winner;
+    } else {
+      state.activePlayer = ctx.chance.pickone(state.players).id;
+    }
+    resolveEvent({ type: EventType.TURN }, state);
+
+    state.winner = undefined;
+    state.gameState = GameState.MID_ROUND;
 
     return Response.ok();
   }
@@ -102,7 +122,7 @@ export class Impl implements Methods<InternalState> {
     resolveEvent(
       {
         actor: userId,
-        action: Action.DRAW,
+        type: EventType.DRAW,
         actorCard: drawnCard,
       },
       state
@@ -135,7 +155,8 @@ export class Impl implements Methods<InternalState> {
       request.card.type,
       state.players,
       userId,
-      selectedPlayer
+      selectedPlayer,
+      request.guessed
     );
     if (error) {
       return error;
@@ -156,12 +177,17 @@ export class Impl implements Methods<InternalState> {
           ? state.hands.get(selectedPlayer.id)![0]
           : undefined,
         guess: request.guessed,
-        action: Action.PLAY,
+        type: EventType.PLAY,
       },
       state
     );
 
-    updateActivePlayer(state);
+    maybeSetGameWinner(state);
+    if (state.winner) {
+      handleRoundEnd(state);
+    } else {
+      updateActivePlayer(state);
+    }
 
     return Response.ok();
   }
@@ -172,6 +198,8 @@ export class Impl implements Methods<InternalState> {
       winner: state.winner,
       eventLog: state.playerEventLogs.get(userId) || [],
       hand: state.hands.get(userId) || [],
+      drawPileSize: state.drawPile.length,
+      gameState: state.gameState,
     };
   }
 }
@@ -193,6 +221,28 @@ function createDeck(): Card[] {
     }
   }
   return deck;
+}
+
+function maybeSetGameWinner(state: InternalState) {
+  const winner = getWinner(state);
+  if (winner) {
+    state.winner = winner;
+  }
+}
+
+function handleRoundEnd(state: InternalState) {
+  const winningPlayer = state.players.filter(
+    (player) => player.id == state.winner
+  )[0];
+  winningPlayer.points += 1;
+  state.gameState = GameState.WAITING_TO_START_ROUND;
+
+  resolveEvent(
+    {
+      type: EventType.ROUND_END,
+    },
+    state
+  );
 }
 
 function validateCardSelection(
@@ -219,10 +269,14 @@ function validateSelectedPlayer(
   cardType: CardType,
   players: PlayerInfo[],
   currentPlayerId: UserId,
-  selectedPlayer?: PlayerInfo
+  selectedPlayer?: PlayerInfo,
+  guessed?: CardType
 ): ErrorResponse | null {
   switch (cardType) {
     case CardType.GUARD:
+      if (!guessed) {
+        return Response.error("Must provide guess if playing Guard");
+      }
     case CardType.PRIEST:
     case CardType.BARON:
     case CardType.KING:
@@ -244,6 +298,7 @@ function validateSelectedPlayer(
       if (!selectedPlayer) {
         return Response.error("Must select player.");
       }
+      break;
     case CardType.COUNTESS:
     case CardType.PRINCESS:
       if (selectedPlayer) {
@@ -264,22 +319,44 @@ function allOtherPlayersAreShielded(
 
 function resolveEvent(event: Event, state: InternalState) {
   state.playerEventLogs.forEach((log, userId) => {
-    log.push(messageForEvent(event, userId));
+    log.push(messageForEvent(event, userId, state));
   });
 }
 
-function messageForEvent(event: Event, userId: UserId): string {
-  switch (event.action) {
-    case Action.DRAW:
+function messageForEvent(
+  event: Event,
+  userId: UserId,
+  state: InternalState
+): string {
+  switch (event.type) {
+    case EventType.DRAW:
       if (event.actor == userId) {
-        return `You drew a ${cardNameTitleCase(event.actorCard)}.`;
+        return `You drew a ${cardNameTitleCase(event.actorCard!)}.`;
       } else {
         return `${event.actor} drew a card.`;
       }
-    case Action.PLAY:
+    case EventType.PLAY:
       return `${event.actor} played a card.`; // TODO
+    case EventType.TURN:
+      if (state.activePlayer == userId) {
+        return "It's your turn!";
+      } else {
+        return `It's ${state.activePlayer}'s turn.`;
+      }
+    case EventType.ROUND_START:
+      return `New round. Scores: ${scoreString(state)}`;
+    case EventType.ROUND_END:
+      // TODO: Victory details?
+      if (state.winner == userId) {
+        return "You won the round! The love letter has been delivered to the princess.";
+      } else {
+        return `${state.winner} won the round, you'll get 'em next time!`;
+      }
+    case EventType.GAME_END:
+      return "TODO";
   }
-  return "";
+
+  fail("Unexhaustive!");
 }
 
 function cardNameTitleCase(card: Card): string {
@@ -287,9 +364,52 @@ function cardNameTitleCase(card: Card): string {
   return cardNameAllCaps[0] + cardNameAllCaps.substring(1).toLowerCase();
 }
 
-function getWinner(state: InternalState): UserId | null {
+function scoreString(state: InternalState): string {
+  return state.players.reduce((acc: string, player: PlayerInfo) => {
+    if (acc) {
+      acc += ", ";
+    }
+    return acc + `${player.id}: ${player.points}pts`;
+  }, "");
+}
+
+function getWinner(state: InternalState): UserId | undefined {
   const activePlayers = state.players.filter((player) => player.isActive);
-  return activePlayers.length == 1 ? activePlayers[0].id : null;
+  if (activePlayers.length == 1) {
+    return activePlayers[0].id;
+  } else if (state.drawPile.length == 0) {
+    // no cards remaining; must select winner
+    const playersWithHighestCard = activePlayers
+      .reduce((highest: [UserId, number][], player: PlayerInfo) => {
+        let playerCardValue = CARD_DETAILS.get(
+          state.hands.get(player.id)![0].type
+        )!.value;
+        if (highest.length == 0) {
+          let newHighest: [UserId, number][] = [[player.id, playerCardValue]];
+          return newHighest;
+        }
+
+        let highestCardValue = highest[0][1];
+        if (playerCardValue == highestCardValue) {
+          // tie
+          highest.push([player.id, playerCardValue]);
+          return highest;
+        } else if (playerCardValue > highestCardValue) {
+          // new highest
+          let newHighest: [UserId, number][] = [[player.id, playerCardValue]];
+          return newHighest;
+        } else {
+          // not highest, keep going
+          return highest;
+        }
+      }, [])
+      .map((entry) => entry[0]);
+
+    // TODO: The true win condition is whichever player discard a higher point value in case of a tie
+    return playersWithHighestCard[0];
+  }
+
+  return undefined;
 }
 
 function updateActivePlayer(state: InternalState) {
@@ -298,5 +418,12 @@ function updateActivePlayer(state: InternalState) {
     (player) => player.id == state.activePlayer
   );
   const nextPlayerIndex = (currentPlayerIndex + 1) % activePlayers.length;
-  state.activePlayer = activePlayers.at(nextPlayerIndex)!.id;
+  const nextPlayer = activePlayers.at(nextPlayerIndex)!.id;
+  state.activePlayer = nextPlayer;
+
+  resolveEvent({ type: EventType.TURN }, state);
+}
+
+function fail(message: string): never {
+  throw new Error(message);
 }

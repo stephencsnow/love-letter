@@ -8,9 +8,17 @@ types:
     - KING
     - COUNTESS
     - PRINCESS
-  Action:
+  EventType:
     - DRAW
     - PLAY
+    - TURN
+    - ROUND_START
+    - ROUND_END
+    - GAME_END
+  GameState:
+    - WAITING_TO_START_GAME
+    - WAITING_TO_START_ROUND
+    - MID_ROUND
   Card:
     type: CardType
   PlayerInfo:
@@ -19,18 +27,20 @@ types:
     isActive: boolean
     isShielded: boolean
   Event:
-    actor: UserId
+    actor: UserId?
     target: UserId?
-    actorCard: Card
+    actorCard: Card?
     targetCard: Card?
     guess: CardType?
-    action: Action
+    type: EventType
   PlayerState:
     players: PlayerInfo[]
     hand: Card[]
     activePlayer: UserId?
     winner: UserId?
     eventLog: string[]
+    drawPileSize: int
+    gameState: GameState
 
 methods:
   joinGame:
