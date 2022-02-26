@@ -1,0 +1,35 @@
+types:
+  CardType:
+    - GUARD
+    - PRIEST
+    - BARON
+    - HANDMAID
+    - PRINCE
+    - KING
+    - COUNTESS
+    - PRINCESS
+  Card:
+    type: CardType
+  PlayerInfo:
+    id: UserId
+    points: int
+    hand: Card[]
+    isActive: boolean
+  PlayerState:
+    players: PlayerInfo[]
+    activePlayer: UserId
+    winner: UserId?
+
+methods:
+  joinGame:
+  startGame:
+  playCard:
+    card: Card
+    player: UserId?
+  drawCard:
+
+auth:
+  anonymous: {}
+
+userState: PlayerState
+error: string
