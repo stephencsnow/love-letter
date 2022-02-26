@@ -8,25 +8,38 @@ types:
     - KING
     - COUNTESS
     - PRINCESS
+  Action:
+    - DRAW
+    - PLAY
   Card:
     type: CardType
   PlayerInfo:
     id: UserId
     points: int
-    hand: Card[]
     isActive: boolean
+    isShielded: boolean
+  Event:
+    actor: UserId
+    target: UserId?
+    actorCard: Card
+    targetCard: Card?
+    guess: CardType?
+    action: Action
   PlayerState:
     players: PlayerInfo[]
-    activePlayer: UserId
+    hand: Card[]
+    activePlayer: UserId?
     winner: UserId?
+    eventLog: string[]
 
 methods:
   joinGame:
   startGame:
+  drawCard:
   playCard:
     card: Card
     player: UserId?
-  drawCard:
+    guessed: CardType?
 
 auth:
   anonymous: {}
