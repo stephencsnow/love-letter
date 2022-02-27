@@ -92,7 +92,7 @@ export class Impl implements Methods<InternalState> {
     });
     state.drawPile = deck;
     state.discard = [];
-    resolveEvent({ type: EventType.ROUND_START }, state);
+    resolveEvent(state, { type: EventType.ROUND_START });
 
     if (state.winner) {
       // last round's winner goes first
@@ -100,7 +100,7 @@ export class Impl implements Methods<InternalState> {
     } else {
       state.activePlayer = ctx.chance.pickone(state.players).id;
     }
-    resolveEvent({ type: EventType.TURN }, state);
+    resolveEvent(state, { type: EventType.TURN });
 
     state.winner = undefined;
     state.gameState = GameState.MID_ROUND;
@@ -195,19 +195,16 @@ export class Impl implements Methods<InternalState> {
       }
     }
 
-    resolveEvent(
-      {
-        actor: userId,
-        target: selectedPlayer ? selectedPlayer.id : undefined,
-        actorCard: playedCard,
-        targetCard: selectedPlayer
-          ? state.hands.get(selectedPlayer.id)![0]
-          : undefined,
-        guardGuess: request.guardGuess,
-        type: EventType.PLAY,
-      },
-      state
-    );
+    resolveEvent(state, {
+      actor: userId,
+      target: selectedPlayer ? selectedPlayer.id : undefined,
+      actorCard: playedCard,
+      targetCard: selectedPlayer
+        ? state.hands.get(selectedPlayer.id)![0]
+        : undefined,
+      guardGuess: request.guardGuess,
+      type: EventType.PLAY,
+    });
 
     maybeSetGameWinner(state);
     if (state.winner) {
@@ -242,14 +239,11 @@ function drawCard(state: InternalState, userId: string): Card {
   }
   getHand(state, userId).push(drawnCard);
 
-  resolveEvent(
-    {
-      actor: userId,
-      type: EventType.DRAW,
-      actorCard: drawnCard,
-    },
-    state
-  );
+  resolveEvent(state, {
+    actor: userId,
+    type: EventType.DRAW,
+    actorCard: drawnCard,
+  });
   return drawnCard;
 }
 
@@ -286,12 +280,9 @@ function handleRoundEnd(state: InternalState) {
   winningPlayer.points += 1;
   state.gameState = GameState.WAITING_TO_START_ROUND;
 
-  resolveEvent(
-    {
-      type: EventType.ROUND_END,
-    },
-    state
-  );
+  resolveEvent(state, {
+    type: EventType.ROUND_END,
+  });
 }
 
 function validateCardSelection(
@@ -378,16 +369,16 @@ function allOtherPlayersAreShielded(
     .every((player) => player.isShielded);
 }
 
-function resolveEvent(event: Event, state: InternalState) {
+function resolveEvent(state: InternalState, event: Event) {
   state.playerEventLogs.forEach((log, userId) => {
-    log.push(messageForEvent(event, userId, state));
+    log.push(messageForEvent(state, event, userId));
   });
 }
 
 function messageForEvent(
+  state: InternalState,
   event: Event,
-  userId: UserId,
-  state: InternalState
+  userId: UserId
 ): string {
   switch (event.type) {
     case EventType.DRAW:
@@ -481,7 +472,7 @@ function updateActivePlayer(state: InternalState) {
   state.activePlayer = nextPlayer.id;
   nextPlayer.isShielded = false;
 
-  resolveEvent({ type: EventType.TURN }, state);
+  resolveEvent(state, { type: EventType.TURN });
 }
 
 function fail(message: string): never {
