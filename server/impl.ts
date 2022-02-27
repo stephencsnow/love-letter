@@ -10,13 +10,13 @@ import {
   IJoinGameRequest,
   IStartGameRequest,
   IPlayCardRequest,
-  IDrawCardRequest,
+  IDrawCardMethodRequest,
   EventType,
   GameState,
 } from "../api/types";
 import { readlink } from "fs";
+import { getSyntheticLeadingComments } from "typescript";
 
-type InternalPlayerInfo = PlayerInfo;
 type InternalState = {
   drawPile: Card[];
   discard: Card[];
@@ -27,6 +27,7 @@ type InternalState = {
   events: Event[];
   playerEventLogs: Map<UserId, string[]>;
   gameState: GameState;
+  burntCard?: Card;
 };
 
 const CARD_DETAILS: Map<CardType, { numInDeck: number; value: number }> =
@@ -83,9 +84,11 @@ export class Impl implements Methods<InternalState> {
     }
 
     const deck = ctx.chance.shuffle(createDeck() as Card[]);
-    const burnt_card = deck.pop();
+    state.burntCard = deck.pop()!;
     state.players.forEach((player) => {
       state.hands.set(player.id, [deck.pop()!]);
+      player.isActive = true;
+      player.isShielded = false;
     });
     state.drawPile = deck;
     state.discard = [];
@@ -104,11 +107,11 @@ export class Impl implements Methods<InternalState> {
 
     return Response.ok();
   }
-  drawCard(
+  drawCardMethod(
     state: InternalState,
     userId: UserId,
     ctx: Context,
-    request: IDrawCardRequest
+    request: IDrawCardMethodRequest
   ): Response {
     if (state.activePlayer !== userId) {
       return Response.error("Not your turn");
@@ -116,17 +119,7 @@ export class Impl implements Methods<InternalState> {
       return Response.error("Already drawn for this turn");
     }
 
-    const drawnCard = state.drawPile.pop()!;
-    state.hands.get(userId)!.push(drawnCard);
-
-    resolveEvent(
-      {
-        actor: userId,
-        type: EventType.DRAW,
-        actorCard: drawnCard,
-      },
-      state
-    );
+    drawCard(state, userId);
 
     return Response.ok();
   }
@@ -148,25 +141,59 @@ export class Impl implements Methods<InternalState> {
       return error;
     }
     const selectedPlayer =
-      request.player !== undefined
-        ? state.players.find((player) => player.id == request.player)
-        : undefined;
-    error = validateSelectedPlayer(
+      request.player != null ? getPlayer(state, request.player) : undefined;
+    error = validateRequest(
       request.card.type,
       state.players,
       userId,
       selectedPlayer,
-      request.guessed
+      request.guardGuess
     );
     if (error) {
       return error;
     }
 
-    const cardIndex = state.hands
-      .get(userId)!
-      .findIndex((card) => card.type == request.card.type);
-    const playedCard = state.hands.get(userId)!.splice(cardIndex, 1)[0];
+    const playerHand = getHand(state, userId);
+    const cardIndex = playerHand.findIndex(
+      (card) => card.type == request.card.type
+    );
+    const playedCard = playerHand.splice(cardIndex, 1)[0];
     state.discard.push(playedCard);
+
+    // resolve card action
+    if (
+      allOtherPlayersAreShielded(state.players, userId) &&
+      (request.card.type == CardType.GUARD ||
+        request.card.type == CardType.PRIEST ||
+        request.card.type == CardType.BARON ||
+        request.card.type == CardType.KING)
+    ) {
+      // no-op
+    } else {
+      switch (playedCard.type) {
+        case CardType.GUARD:
+          resolveGuard(state, selectedPlayer!.id, request.guardGuess!);
+          break;
+        case CardType.PRIEST:
+          break; // log only
+        case CardType.BARON:
+          resolveBaron(state, userId, selectedPlayer!.id);
+          break;
+        case CardType.HANDMAID:
+          resolveHandmaid(state, userId);
+          break;
+        case CardType.PRINCE:
+          resolvePrince(state, selectedPlayer!.id);
+          break;
+        case CardType.KING:
+          resolveKing(state, userId, selectedPlayer!.id);
+          break;
+        case CardType.COUNTESS:
+          break; // log only
+        case CardType.PRINCESS:
+          resolvePrincess(state, userId);
+      }
+    }
 
     resolveEvent(
       {
@@ -176,7 +203,7 @@ export class Impl implements Methods<InternalState> {
         targetCard: selectedPlayer
           ? state.hands.get(selectedPlayer.id)![0]
           : undefined,
-        guess: request.guessed,
+        guardGuess: request.guardGuess,
         type: EventType.PLAY,
       },
       state
@@ -204,7 +231,29 @@ export class Impl implements Methods<InternalState> {
   }
 }
 
-function createPlayer(id: UserId): InternalPlayerInfo {
+function drawCard(state: InternalState, userId: string): Card {
+  let drawnCard;
+  if (state.drawPile.length == 0) {
+    // Special condition in case a prince is used.
+    drawnCard = state.burntCard!;
+    state.burntCard = undefined;
+  } else {
+    drawnCard = state.drawPile.pop()!;
+  }
+  getHand(state, userId).push(drawnCard);
+
+  resolveEvent(
+    {
+      actor: userId,
+      type: EventType.DRAW,
+      actorCard: drawnCard,
+    },
+    state
+  );
+  return drawnCard;
+}
+
+function createPlayer(id: UserId): PlayerInfo {
   return {
     id,
     points: 0,
@@ -265,40 +314,52 @@ function handContains(hand: Card[], cardType: CardType): boolean {
   return hand.filter((card) => card.type == cardType).length > 0;
 }
 
-function validateSelectedPlayer(
+function validateRequest(
   cardType: CardType,
   players: PlayerInfo[],
   currentPlayerId: UserId,
   selectedPlayer?: PlayerInfo,
-  guessed?: CardType
+  guardGuess?: CardType
 ): ErrorResponse | null {
   switch (cardType) {
     case CardType.GUARD:
-      if (!guessed) {
-        return Response.error("Must provide guess if playing Guard");
+      if (guardGuess == null) {
+        return Response.error("Must provide guess if playing Guard.");
+      }
+      if (guardGuess == CardType.GUARD) {
+        return Response.error("Cannot guess guard.");
       }
     case CardType.PRIEST:
     case CardType.BARON:
     case CardType.KING:
       if (!selectedPlayer) {
-        return Response.error("Must select other player.");
-      } else if (
+        return Response.error("Must select player.");
+      }
+      if (!selectedPlayer.isActive) {
+        return Response.error("Must select active player.");
+      }
+      if (selectedPlayer.isShielded) {
+        return Response.error("Cannot select player with Handmaiden effect.");
+      }
+      if (
         !allOtherPlayersAreShielded(players, currentPlayerId) &&
         selectedPlayer.id == currentPlayerId
       ) {
         return Response.error("Must select other player.");
       }
       break;
-    case CardType.HANDMAID:
-      if (!selectedPlayer || selectedPlayer.id !== currentPlayerId) {
-        return Response.error("Must select self.");
-      }
-      break;
     case CardType.PRINCE:
       if (!selectedPlayer) {
         return Response.error("Must select player.");
       }
+      if (!selectedPlayer.isActive) {
+        return Response.error("Must select active player.");
+      }
+      if (selectedPlayer.isShielded) {
+        return Response.error("Cannot select player with Handmaiden effect.");
+      }
       break;
+    case CardType.HANDMAID:
     case CardType.COUNTESS:
     case CardType.PRINCESS:
       if (selectedPlayer) {
@@ -381,9 +442,7 @@ function getWinner(state: InternalState): UserId | undefined {
     // no cards remaining; must select winner
     const playersWithHighestCard = activePlayers
       .reduce((highest: [UserId, number][], player: PlayerInfo) => {
-        let playerCardValue = CARD_DETAILS.get(
-          state.hands.get(player.id)![0].type
-        )!.value;
+        const playerCardValue = getCardValue(getHand(state, player.id)[0]);
         if (highest.length == 0) {
           let newHighest: [UserId, number][] = [[player.id, playerCardValue]];
           return newHighest;
@@ -418,12 +477,98 @@ function updateActivePlayer(state: InternalState) {
     (player) => player.id == state.activePlayer
   );
   const nextPlayerIndex = (currentPlayerIndex + 1) % activePlayers.length;
-  const nextPlayer = activePlayers.at(nextPlayerIndex)!.id;
-  state.activePlayer = nextPlayer;
+  const nextPlayer = activePlayers.at(nextPlayerIndex)!;
+  state.activePlayer = nextPlayer.id;
+  nextPlayer.isShielded = false;
 
   resolveEvent({ type: EventType.TURN }, state);
 }
 
 function fail(message: string): never {
   throw new Error(message);
+}
+
+// Resolvers
+function resolveGuard(
+  state: InternalState,
+  selectedPlayerId: UserId,
+  guardGuess: CardType
+) {
+  if (getHand(state, selectedPlayerId)[0].type == guardGuess) {
+    eliminatePlayer(state, selectedPlayerId);
+  }
+}
+
+function resolveBaron(
+  state: InternalState,
+  userId: UserId,
+  selectedPlayerId: UserId
+) {
+  const actorCardValue = getCardValue(getHand(state, userId)[0]);
+  const targetCardValue = getCardValue(getHand(state, selectedPlayerId)[0]);
+
+  if (actorCardValue == targetCardValue) {
+    // nothing in case of tie
+    return;
+  }
+
+  actorCardValue > targetCardValue
+    ? eliminatePlayer(state, selectedPlayerId)
+    : eliminatePlayer(state, userId);
+}
+
+function resolveHandmaid(state: InternalState, userId: UserId) {
+  getPlayer(state, userId).isShielded = true;
+}
+
+function resolvePrince(state: InternalState, selectedPlayerId: UserId) {
+  const hand = getHand(state, selectedPlayerId);
+
+  const discardedCard = hand.pop()!;
+  state.discard.push(discardedCard);
+
+  if (discardedCard.type == CardType.PRINCESS) {
+    eliminatePlayer(state, selectedPlayerId);
+  } else {
+    drawCard(state, selectedPlayerId);
+  }
+}
+
+function resolveKing(
+  state: InternalState,
+  userId: UserId,
+  selectedPlayerId: UserId
+) {
+  const actorHand = getHand(state, userId);
+  const targetHand = getHand(state, selectedPlayerId);
+  const actorCard = actorHand.pop()!;
+  const targetCard = targetHand.pop()!;
+
+  actorHand.push(targetCard);
+  targetHand.push(actorCard);
+}
+
+function resolvePrincess(state: InternalState, userId: UserId) {
+  eliminatePlayer(state, userId);
+}
+
+function getHand(state: InternalState, userId: UserId): Card[] {
+  return state.hands.get(userId)!;
+}
+
+function getPlayer(state: InternalState, userId: UserId): PlayerInfo {
+  return state.players.find((player) => player.id == userId)!;
+}
+
+function eliminatePlayer(state: InternalState, userId: UserId) {
+  const player = getPlayer(state, userId);
+  player.isActive = false;
+  const hand = getHand(state, userId);
+  if (hand.length != 0) {
+    state.discard.push(hand.pop()!);
+  }
+}
+
+function getCardValue(card: Card): number {
+  return CARD_DETAILS.get(card.type)!.value;
 }

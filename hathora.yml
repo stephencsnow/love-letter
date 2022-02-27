@@ -31,7 +31,7 @@ types:
     target: UserId?
     actorCard: Card?
     targetCard: Card?
-    guess: CardType?
+    guardGuess: CardType?
     type: EventType
   PlayerState:
     players: PlayerInfo[]
@@ -45,11 +45,11 @@ types:
 methods:
   joinGame:
   startGame:
-  drawCard:
+  drawCardMethod:
   playCard:
     card: Card
     player: UserId?
-    guessed: CardType?
+    guardGuess: CardType?
 
 auth:
   anonymous: {}
